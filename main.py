@@ -486,6 +486,7 @@ class NaturalCompanionPlugin(Star):
                     return
                 allowed, reason = can_send(self.state, time.time(), self.config)
                 if not allowed:
+                    self._last_runtime_issue = f"主动机会已跳过：{reason}"
                     self._record_skip_locked(
                         pending,
                         reason_summary=f"发送前限制：{reason}",
@@ -496,6 +497,7 @@ class NaturalCompanionPlugin(Star):
                 umo = self.state.bound_umo
                 created_at = _number(pending.get("created_at"), 0.0)
                 if self.state.last_user_message_at > created_at:
+                    self._last_runtime_issue = "用户新消息取消了这次主动机会"
                     self.state.pending_opportunity = None
                     self._persist_locked()
                     return
@@ -512,11 +514,13 @@ class NaturalCompanionPlugin(Star):
                 if self.state.last_user_message_at > _number(
                     pending.get("created_at"), 0.0
                 ) or self._message_revision != message_revision:
+                    self._last_runtime_issue = "用户新消息取消了这次主动机会"
                     self.state.pending_opportunity = None
                     self._persist_locked()
                     return
                 allowed, reason = can_send(self.state, time.time(), self.config)
                 if not allowed:
+                    self._last_runtime_issue = f"模型判断后跳过主动机会：{reason}"
                     self._record_skip_locked(
                         pending,
                         reason_summary=f"模型判断后限制：{reason}",
@@ -525,6 +529,7 @@ class NaturalCompanionPlugin(Star):
                     self._persist_locked()
                     return
                 if not decision["send"]:
+                    self._last_runtime_issue = "发送前模型判断为暂时不打扰"
                     self._record_skip_locked(
                         pending,
                         reason_type=decision["reason_type"],
@@ -548,6 +553,7 @@ class NaturalCompanionPlugin(Star):
                     return
                 self.state.pending_opportunity = None
                 if success:
+                    self._last_runtime_issue = "主动消息已发送"
                     self.state.last_proactive_message_at = timestamp
                     cooldown = int(decision.get("next_cooldown_minutes") or 0)
                     if cooldown > 0:
@@ -564,6 +570,7 @@ class NaturalCompanionPlugin(Star):
                         )
                     )
                 else:
+                    self._last_runtime_issue = "OneBot 主动消息发送失败，请查看 AstrBot 日志"
                     self.state.recent_proactive_outcomes.append(
                         make_outcome(
                             "failed",
@@ -581,6 +588,7 @@ class NaturalCompanionPlugin(Star):
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._last_runtime_issue = "主动聊天任务失败，请查看 AstrBot 日志"
             logger.warning(f"[{PLUGIN_ID}] 主动聊天任务失败，已停止本次机会：{exc}")
             async with self._state_lock:
                 pending = self.state.pending_opportunity
