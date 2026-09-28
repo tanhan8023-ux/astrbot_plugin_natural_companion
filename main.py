@@ -321,8 +321,11 @@ class NaturalCompanionPlugin(Star):
             if not self.state.enabled or self.state.bound_umo != umo:
                 return
             self._message_revision += 1
+            had_pending = self.state.pending_opportunity is not None
             self._cancel_pending_locked()
             self._cancel_extract_locked()
+            if had_pending:
+                self._last_runtime_issue = "用户新消息取消了已等待的主动机会"
             timestamp = time.time()
             self.state.last_user_message_at = timestamp
             if not has_extractable_text:
