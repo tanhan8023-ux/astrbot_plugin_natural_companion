@@ -48,8 +48,13 @@ except ImportError:  # pragma: no cover - convenient for local smoke imports
     )
 
 
+# In QQ clients it is common to prepend the bot nickname directly to a
+# command, e.g. ``系尔主动聊天 测试``.  Keep the normal slash form while
+# accepting a short nickname prefix so that such a command is not treated as
+# an ordinary message that cancels a pending opportunity.
 COMMAND_PATTERN = re.compile(
-    r"^[\s/!！／]*(?:主动聊天|主动找我)(?:\s+(.+?))?\s*$"
+    r"^[\s/!！／]*(?:[\u4e00-\u9fffA-Za-z0-9_.·-]{1,12}\s*)?"
+    r"(?:主动聊天|主动找我)(?:\s+(.+?))?\s*$"
 )
 EXACT_PAUSE_PHRASES = {
     "别主动找我",
