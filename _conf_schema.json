@@ -70,6 +70,22 @@
     "max": 1,
     "hint": "越高越不容易在没有具体话题时主动开口。"
   },
+  "natural_greeting_min_delay_minutes": {
+    "description": "自然问候的最短延迟（分钟）",
+    "type": "int",
+    "default": 60,
+    "min": 0,
+    "max": 10080,
+    "hint": "正式使用建议保持较高值；联调时可临时改小。"
+  },
+  "test_delay_seconds": {
+    "description": "主动聊天测试命令的延迟（秒）",
+    "type": "int",
+    "default": 10,
+    "min": 0,
+    "max": 300,
+    "hint": "仅用于 /主动聊天 测试，不影响正常主动机会。"
+  },
   "allow_natural_greeting": {
     "description": "允许没有具体话题时进行轻量问候",
     "type": "bool",

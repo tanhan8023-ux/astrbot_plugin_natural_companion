@@ -169,6 +169,14 @@ class PluginSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.state.last_user_message_at, 0.0)
         self.assertIsNone(self.plugin._extract_task)
 
+    async def test_explicit_test_command_arms_short_one_shot_opportunity(self):
+        umo = await self._bind()
+        self.plugin.config["test_delay_seconds"] = 60
+        result = await self.plugin._handle_command(FakeEvent(umo), "测试")
+        self.assertIn("测试主动机会", result)
+        self.assertIsNotNone(self.plugin.state.pending_opportunity)
+        self.assertTrue(self.plugin.state.pending_opportunity["test_mode"])
+
     async def test_rebind_clears_previous_private_chat_memory(self):
         old_umo = await self._bind("aiocqhttp:private:old")
         self.plugin.state.current_scene = "旧会话情景"

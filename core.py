@@ -24,6 +24,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "state_extract_debounce_seconds": 15,
     "opportunity_threshold": 0.55,
     "natural_greeting_threshold": 0.72,
+    "natural_greeting_min_delay_minutes": 60,
+    "test_delay_seconds": 10,
     "allow_natural_greeting": True,
     "max_history_chars": 7000,
     "max_persona_chars": 3500,
@@ -365,14 +367,19 @@ def evaluate_opportunity(
         return None
 
     reasons: list[tuple[str, float]] = []
+    # A single concrete reason should be strong enough to create an
+    # opportunity.  The previous weights (0.38/0.22/0.18) meant that a
+    # perfectly valid unfinished topic or emotional residue could never
+    # reach the default 0.55 threshold on its own, so normal conversations
+    # silently produced no pending task.
     if state.unfinished_topics:
-        reasons.append(("unfinished_topic", 0.38))
+        reasons.append(("unfinished_topic", 0.65))
     if state.memory_cues:
-        reasons.append(("memory_cue", 0.22))
+        reasons.append(("memory_cue", 0.58))
     if state.mood.label not in {"", "平静", "普通"}:
-        reasons.append(("emotional_residue", 0.18))
+        reasons.append(("emotional_residue", 0.58))
     if state.current_scene:
-        reasons.append(("scene_change", 0.10))
+        reasons.append(("scene_change", 0.18))
 
     score = sum(weight for _, weight in reasons)
     threshold = clamp(_safe_float(config.get("opportunity_threshold"), 0.55), 0.0, 1.0)
@@ -419,7 +426,11 @@ def choose_delay_seconds(
     score = clamp(_safe_float(candidate.get("score"), 0.72), 0.0, 1.0)
 
     if reason_type == "natural_greeting":
-        minimum = max(minimum, 60 * 60)
+        natural_minimum = max(
+            0.0,
+            _safe_float(config.get("natural_greeting_min_delay_minutes"), 60.0),
+        ) * 60
+        minimum = max(minimum, natural_minimum)
     elif reason_type in {"emotional_residue", "unfinished_topic", "mixed"}:
         # Stronger reasons are allowed to appear sooner, but remain delayed.
         ratio = 1.0 - clamp((score - 0.55) / 0.45, 0.0, 1.0)

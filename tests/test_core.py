@@ -121,6 +121,23 @@ class CoreTests(unittest.TestCase):
         self.assertGreaterEqual(candidate["score"], 0.55)
         self.assertLessEqual(candidate["score"], 1.0)
 
+    def test_each_concrete_reason_can_create_an_opportunity(self):
+        for field_name, value in (
+            ("unfinished_topics", ["还没聊完的旅行计划"]),
+            ("memory_cues", ["周末约定"]),
+        ):
+            state = enabled_state()
+            setattr(state, field_name, value)
+            candidate = evaluate_opportunity(state, 2_000.0, config())
+            self.assertIsNotNone(candidate, field_name)
+            self.assertEqual(candidate["reason_type"], field_name[:-1] if field_name.endswith("s") else field_name)
+
+        state = enabled_state()
+        state.mood = MoodState("担心", -0.6, 0.7, "")
+        candidate = evaluate_opportunity(state, 2_000.0, config())
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["reason_type"], "emotional_residue")
+
     def test_natural_greeting_requires_interaction_summary(self):
         state = enabled_state()
         state.unfinished_topics = []
@@ -138,6 +155,19 @@ class CoreTests(unittest.TestCase):
         candidate = {"reason_type": "natural_greeting", "score": 0.72}
         delay = choose_delay_seconds(candidate, config(), random.Random(1))
         self.assertGreaterEqual(delay, 60 * 60)
+
+    def test_natural_greeting_delay_can_be_shortened_for_integration_test(self):
+        candidate = {"reason_type": "natural_greeting", "score": 0.72}
+        delay = choose_delay_seconds(
+            candidate,
+            config(
+                min_delay_minutes=0,
+                max_delay_minutes=0,
+                natural_greeting_min_delay_minutes=0,
+            ),
+            random.Random(1),
+        )
+        self.assertEqual(delay, 0)
 
     def test_decision_parser_rejects_invalid_or_empty_message(self):
         decision = parse_decision('{"send": true, "message": ""}')

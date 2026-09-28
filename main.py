@@ -89,6 +89,7 @@ class NaturalCompanionPlugin(Star):
         # common race where a new user message arrives while the model is busy.
         self._message_revision = 0
         self._closed = False
+        self._last_runtime_issue = ""
 
     async def initialize(self) -> None:
         """Restore one persisted opportunity without ever sending immediately."""
@@ -198,6 +199,9 @@ class NaturalCompanionPlugin(Star):
             "解绑": "解绑",
             "帮助": "帮助",
             "help": "帮助",
+            "测试": "测试",
+            "test": "测试",
+            "立即测试": "测试",
         }
         return aliases.get(action, "未知")
 
@@ -218,7 +222,8 @@ class NaturalCompanionPlugin(Star):
                 "/主动聊天 状态\n"
                 "/主动聊天 重绑\n"
                 "/主动聊天 清除记忆\n"
-                "/主动聊天 解绑"
+                "/主动聊天 解绑\n"
+                "/主动聊天 测试"
             )
 
         if action == "开启":
@@ -235,6 +240,25 @@ class NaturalCompanionPlugin(Star):
 
         if not is_owner and not is_admin:
             return "这个主动聊天插件已经绑定到其他私聊，当前会话无权查看或修改它。"
+
+        if action == "测试":
+            async with self._state_lock:
+                if not self.state.enabled or self.state.bound_umo != umo:
+                    return "请先在目标私聊中发送 /主动聊天 开启。"
+                self._cancel_pending_locked()
+                now = time.time()
+                candidate = {
+                    "reason_type": "natural_greeting",
+                    "score": 1.0,
+                    "created_at": now,
+                    "test_mode": True,
+                }
+                delay = max(
+                    0.0,
+                    _number(self.config.get("test_delay_seconds"), 10.0),
+                )
+                self._arm_candidate_locked(candidate, delay_seconds=delay)
+            return f"已创建测试主动机会，约 {int(delay)} 秒后进行发送测试；期间不要再发消息。"
 
         if action == "重绑":
             async with self._state_lock:
@@ -343,8 +367,10 @@ class NaturalCompanionPlugin(Star):
                 if not payload:
                     # Invalid JSON or an unavailable conversation must not alter
                     # old structured state and must not create a new opportunity.
+                    self._last_runtime_issue = "状态抽取没有返回有效结果，请检查当前会话和聊天模型"
                     self._persist_locked()
                     return
+                self._last_runtime_issue = ""
                 merge_extraction(self.state, payload)
                 # Keep a compact model-produced summary rather than the user's
                 # raw latest message in plugin persistence.
@@ -357,10 +383,12 @@ class NaturalCompanionPlugin(Star):
                 if candidate:
                     self._arm_candidate_locked(candidate)
                 else:
+                    self._last_runtime_issue = "状态已更新，但本次没有达到主动机会条件"
                     self._persist_locked()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            self._last_runtime_issue = "状态抽取调用失败，请检查 AstrBot 模型配置或日志"
             logger.warning(f"[{PLUGIN_ID}] 状态抽取失败，已安全跳过：{exc}")
         finally:
             if asyncio.current_task() is self._extract_task:
@@ -409,17 +437,29 @@ class NaturalCompanionPlugin(Star):
         )
         return parse_json_object(raw)
 
-    def _arm_candidate_locked(self, candidate: Mapping[str, Any]) -> None:
+    def _arm_candidate_locked(
+        self,
+        candidate: Mapping[str, Any],
+        delay_seconds: float | None = None,
+    ) -> None:
         self._cancel_pending_locked()
         opportunity_id = uuid.uuid4().hex
-        delay = choose_delay_seconds(candidate, self.config, self._rng)
+        delay = (
+            max(0.0, float(delay_seconds))
+            if delay_seconds is not None
+            else choose_delay_seconds(candidate, self.config, self._rng)
+        )
         due_at = time.time() + delay
+        self._last_runtime_issue = (
+            f"已创建主动机会，预计 {_format_time(due_at)} 再进行发送前判断"
+        )
         self.state.pending_opportunity = {
             "id": opportunity_id,
             "created_at": _number(candidate.get("created_at"), time.time()),
             "due_at": due_at,
             "reason_type": str(candidate.get("reason_type", "natural_greeting")),
             "score": _number(candidate.get("score"), 0.0),
+            "test_mode": bool(candidate.get("test_mode", False)),
             "status": "waiting",
         }
         self._persist_locked()
@@ -571,7 +611,15 @@ class NaturalCompanionPlugin(Star):
             )
         history = self._conversation_history(conversation)
         persona = await self._persona_prompt(conversation)
-        prompt = f"""现在时间：{datetime.now().astimezone().isoformat(timespec='minutes')}
+        test_hint = (
+            "这是用户主动发起的联调测试。请生成一条低压力、简短的普通聊天消息，"
+            "用于验证主动发送链路；不要把测试细节或内部实现告诉用户。"
+            if candidate.get("test_mode")
+            else "这是正常的自然主动聊天机会；没有自然理由时必须拒绝发送。"
+        )
+        prompt = f"""{test_hint}
+
+现在时间：{datetime.now().astimezone().isoformat(timespec='minutes')}
 
 机器人当前人设：
 {persona or '未提供明确人设；延续近期聊天中的表达方式。'}
@@ -608,7 +656,11 @@ class NaturalCompanionPlugin(Star):
         get_provider = getattr(self.context, "get_current_chat_provider_id", None)
         if not callable(get_provider):
             raise RuntimeError("当前会话没有可用的聊天模型")
-        provider_id = await _maybe_await(get_provider(umo=umo))
+        try:
+            provider_id = await _maybe_await(get_provider(umo=umo))
+        except TypeError:
+            # Some 4.x minor versions expose the same method positionally.
+            provider_id = await _maybe_await(get_provider(umo))
         if not provider_id:
             raise RuntimeError("当前会话没有可用的聊天模型")
 
@@ -638,7 +690,13 @@ class NaturalCompanionPlugin(Star):
         else:
             kwargs["prompt"] = f"{system_prompt}\n\n{prompt}"
 
-        response = await _maybe_await(generate(**kwargs))
+        try:
+            response = await _maybe_await(generate(**kwargs))
+        except TypeError:
+            fallback = dict(kwargs)
+            fallback.pop("chat_provider_id", None)
+            fallback["provider_id"] = provider_id
+            response = await _maybe_await(generate(**fallback))
         if isinstance(response, Mapping):
             for key in ("completion_text", "text", "content"):
                 value = response.get(key)
@@ -800,15 +858,18 @@ class NaturalCompanionPlugin(Star):
             pending_text = f"有 1 个待判断机会（{_format_time(due_at)}）"
         else:
             pending_text = "无待判断机会"
+        scene = truncate(self.state.current_scene or self.state.last_interaction_summary, 100)
         return (
             f"自然主动聊天：{enabled}，{bound}\n"
             f"当前心情：{self.state.mood.label}"
             + (f"（{self.state.mood.note}）" if self.state.mood.note else "")
             + "\n"
+            f"当前情景：{scene or '暂无'}\n"
             f"未完话题：{len(self.state.unfinished_topics)} 个\n"
             f"最近用户消息：{_format_time(self.state.last_user_message_at)}\n"
             f"最近主动消息：{_format_time(self.state.last_proactive_message_at)}\n"
-            f"主动机会：{pending_text}"
+            f"主动机会：{pending_text}\n"
+            f"处理状态：{self._last_runtime_issue or '等待新的对话状态'}"
         )
 
     def _debug(self, message: str) -> None:
