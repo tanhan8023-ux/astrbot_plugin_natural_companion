@@ -1,0 +1,16 @@
+name: astrbot_plugin_natural_companion
+display_name: 自然主动聊天
+short_desc: 根据心情、情景、人设和会话记忆，自然地决定是否主动找你聊天。
+desc: >-
+  面向单个 QQ/OneBot v11 私聊的状态驱动主动聊天插件。它不按固定周期发送消息，
+  而是在对话状态产生合适理由时创建一次随机、可取消的主动机会，并在发送前再次由当前模型判断。
+author: codex
+version: 0.1.0
+support_platforms:
+  - aiocqhttp
+astrbot_version: ">=4.5.7,<5"
+tags:
+  - 主动聊天
+  - 人设
+  - 情绪
+  - OneBot

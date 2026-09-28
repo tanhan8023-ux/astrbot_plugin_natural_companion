@@ -1,0 +1,104 @@
+{
+  "min_delay_minutes": {
+    "description": "普通主动机会的最短延迟（分钟）",
+    "type": "int",
+    "default": 20,
+    "min": 1,
+    "max": 1440,
+    "hint": "不是固定发送时间；每次机会会在范围内随机等待，并可被新消息取消。"
+  },
+  "max_delay_minutes": {
+    "description": "主动机会的最长延迟（分钟）",
+    "type": "int",
+    "default": 240,
+    "min": 1,
+    "max": 10080,
+    "hint": "自然问候会使用更长的延迟。"
+  },
+  "min_gap_minutes": {
+    "description": "两条主动消息之间的最短间隔（分钟）",
+    "type": "int",
+    "default": 45,
+    "min": 1,
+    "max": 10080
+  },
+  "max_proactive_per_24h": {
+    "description": "24 小时内最多主动发送条数",
+    "type": "int",
+    "default": 2,
+    "min": 0,
+    "max": 24,
+    "hint": "设为 0 表示不限制，但不建议这样做。"
+  },
+  "quiet_hours_enabled": {
+    "description": "启用安静时段",
+    "type": "bool",
+    "default": true
+  },
+  "quiet_start": {
+    "description": "安静时段开始时间",
+    "type": "string",
+    "default": "00:00",
+    "hint": "使用本机时区，格式为 HH:MM。"
+  },
+  "quiet_end": {
+    "description": "安静时段结束时间",
+    "type": "string",
+    "default": "07:00",
+    "hint": "使用本机时区，格式为 HH:MM。"
+  },
+  "state_extract_debounce_seconds": {
+    "description": "状态抽取防抖等待（秒）",
+    "type": "int",
+    "default": 15,
+    "min": 1,
+    "max": 300,
+    "hint": "连续聊天时只在短暂停顿后抽取一次，避免每条消息调用模型。"
+  },
+  "opportunity_threshold": {
+    "description": "有具体理由时的主动机会阈值",
+    "type": "float",
+    "default": 0.55,
+    "min": 0,
+    "max": 1
+  },
+  "natural_greeting_threshold": {
+    "description": "自然问候的主动机会阈值",
+    "type": "float",
+    "default": 0.72,
+    "min": 0,
+    "max": 1,
+    "hint": "越高越不容易在没有具体话题时主动开口。"
+  },
+  "allow_natural_greeting": {
+    "description": "允许没有具体话题时进行轻量问候",
+    "type": "bool",
+    "default": true
+  },
+  "max_history_chars": {
+    "description": "发送决策使用的最近会话字符数",
+    "type": "int",
+    "default": 7000,
+    "min": 1000,
+    "max": 30000
+  },
+  "max_persona_chars": {
+    "description": "发送决策使用的人设字符数",
+    "type": "int",
+    "default": 3500,
+    "min": 500,
+    "max": 12000
+  },
+  "max_message_chars": {
+    "description": "主动消息最大字符数",
+    "type": "int",
+    "default": 500,
+    "min": 50,
+    "max": 2000
+  },
+  "debug_logging": {
+    "description": "输出主动机会调试日志",
+    "type": "bool",
+    "default": false
+  }
+}
