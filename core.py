@@ -31,6 +31,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_persona_chars": 3500,
     "max_message_chars": 500,
     "debug_logging": False,
+    "phone_bridge_enabled": False,
+    "phone_bridge_path": "",
+    "phone_bridge_check_seconds": 5,
 }
 
 REASON_TYPES = {
@@ -175,6 +178,10 @@ class CompanionState:
     user_preferences: list[str] = field(default_factory=list)
     quiet_until: float = 0.0
     pending_opportunity: dict[str, Any] | None = None
+    phone_binding_id: str = ""
+    phone_event_ids: list[str] = field(default_factory=list)
+    phone_cursor_ready: bool = False
+    last_phone_message_at: float = 0.0
     recent_proactive_outcomes: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -211,6 +218,10 @@ class CompanionState:
             user_preferences=_string_list(value.get("user_preferences")),
             quiet_until=_safe_float(value.get("quiet_until"), 0.0),
             pending_opportunity=dict(pending) if pending else None,
+            phone_binding_id=truncate(value.get("phone_binding_id", ""), 160),
+            phone_event_ids=_string_list(value.get("phone_event_ids"), 80, 160),
+            phone_cursor_ready=bool(value.get("phone_cursor_ready", False)),
+            last_phone_message_at=_safe_float(value.get("last_phone_message_at"), 0.0),
             recent_proactive_outcomes=clean_outcomes,
         )
 
@@ -230,6 +241,10 @@ class CompanionState:
             "user_preferences": list(self.user_preferences),
             "quiet_until": self.quiet_until,
             "pending_opportunity": self.pending_opportunity,
+            "phone_binding_id": self.phone_binding_id,
+            "phone_event_ids": list(self.phone_event_ids[-80:]),
+            "phone_cursor_ready": self.phone_cursor_ready,
+            "last_phone_message_at": self.last_phone_message_at,
             "recent_proactive_outcomes": list(self.recent_proactive_outcomes[-20:]),
         }
 
@@ -245,6 +260,10 @@ class CompanionState:
         self.user_preferences.clear()
         self.quiet_until = 0.0
         self.pending_opportunity = None
+        self.phone_binding_id = ""
+        self.phone_event_ids.clear()
+        self.phone_cursor_ready = False
+        self.last_phone_message_at = 0.0
         self.recent_proactive_outcomes.clear()
 
 

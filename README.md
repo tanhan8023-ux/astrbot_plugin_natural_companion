@@ -20,6 +20,7 @@ metadata.yaml
 _conf_schema.json
 main.py
 core.py
+bridge.py
 ```
 
 首版按 AstrBot 4.x（最低 4.5.7）和 `aiocqhttp`/OneBot v11 适配器设计。插件不接入天气、新闻、日历等外部信息。
@@ -101,6 +102,16 @@ AstrBot WebUI 会读取 `_conf_schema.json`。可以调整：
 - 是否允许没有具体话题时进行轻量问候；
 - 调试日志。
 
+### 小手机（Alive Persona）互通
+
+在**同一个 AstrBot 运行环境**中先启用 Alive Persona 插件的 `bridge_enabled`，将 `bridge_allowed_user_id` 设置成绑定私聊的 QQ 数字 ID，并在小手机中绑定这个账号。确认 Alive Persona 的 `data/sheshe_bridge.json` 已生成，里面有同一个 QQ 号的 `binding.userId` 和非空的 `binding.bindingId`。不要在群聊使用本插件绑定。
+
+然后在本插件 WebUI 开启 `phone_bridge_enabled` 并重载插件。默认会尝试读取 `AstrBot/data/plugins/astrbot_plugin_alive_persona/data/sheshe_bridge.json`；若 Alive Persona 安装目录不同，请把 `phone_bridge_path` 填为**AstrBot 进程实际可读取的** `sheshe_bridge.json` 绝对路径。在 Docker 中应填容器内路径，而非 Windows 主机路径。仅填写插件源码目录并不会自动发现文件。本插件只读桥接文件，不会修改小手机的数据。
+
+`phone_bridge_check_seconds` 默认 5 秒，仅用于发现本地文件里的新对话，不是定时发消息。发现后还要等待状态抽取防抖（默认 15 秒）及模型响应。首次连接只用已有小手机历史刷新状态，**不会补发过去错过的主动消息**；后续手机用户消息会取消旧机会、更新 QQ 状态，并在理由足够时创建新的随机延迟机会。小手机助手回复会进入短期模型上下文，但不算用户新消息。QQ 或小手机的新用户消息都会取消等待中的机会。
+
+在 QQ 私聊发送 `/主动聊天 状态` 检查 `插件版本：0.1.3`、`小手机互通：已连接` 和最近小手机消息时间。如果显示“不可用”，依次核对文件绝对路径、文件读权限、Alive Persona 绑定 QQ 号和私聊绑定；此时插件会暂停主动机会，以免基于过时的手机对话发送。若显示“已连接”但状态未更新，检查手机端是否已同步新对话，并开启 `debug_logging` 查看 AstrBot 日志中的模型错误。桥接不独立保存手机原文；`/主动聊天 清除记忆` 也不会删除 Alive Persona 本身的历史。
+
 ## 数据位置
 
 插件状态默认保存为：
@@ -117,7 +128,7 @@ data/plugin_data/astrbot_plugin_natural_companion/state.json
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile core.py main.py
+python -m py_compile core.py main.py bridge.py
 ```
 
 OneBot v11 联调时，推荐在 AstrBot WebUI 中把 `test_delay_seconds` 保持为 10，然后在已绑定的私聊发送：
@@ -141,7 +152,7 @@ OneBot v11 联调时，推荐在 AstrBot WebUI 中把 `test_delay_seconds` 保�
 忽略通知时不会阻断其他插件处理该通知。新增模拟 OneBot 事件的回归测试，覆盖等待阶段、模型判断阶段、状态查询和真实媒体消息。
 测试使用模型及平台替身；不等同于真实 QQ 环境已联调成功。
 
-更新后重载插件，发送 `/主动聊天 状态`，应看到 `插件版本：0.1.2`。
+0.1.2 修复更新后曾显示 `插件版本：0.1.2`；当前 0.1.3 应显示 `插件版本：0.1.3`。
 触发通知后，状态会单独显示“事件过滤：…输入状态通知（不影响主动任务）”，不再冒充用户新消息。
 调试日志只记录事件类别，不输出原始事件、QQ 号或消息原文。
 保留原有 `state.json`，无需清空绑定或插件记忆；旧的非文本情景摘要会在下一次正常聊天抽取后更新。

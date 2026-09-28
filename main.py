@@ -48,7 +48,13 @@ except ImportError:  # pragma: no cover - convenient for local smoke imports
     )
 
 
-PLUGIN_VERSION = "0.1.2"
+try:
+    from .bridge import PhoneSnapshot, bound_qq_id, phone_context, read_phone_snapshot
+except ImportError:  # pragma: no cover - local smoke imports
+    from bridge import PhoneSnapshot, bound_qq_id, phone_context, read_phone_snapshot  # type: ignore
+
+
+PLUGIN_VERSION = "0.1.3"
 
 
 # In QQ clients it is common to prepend the bot nickname directly to a
@@ -97,6 +103,11 @@ class NaturalCompanionPlugin(Star):
         self._state_lock = asyncio.Lock()
         self._pending_task: asyncio.Task[None] | None = None
         self._extract_task: asyncio.Task[None] | None = None
+        self._phone_task: asyncio.Task[None] | None = None
+        self._phone_sync_lock = asyncio.Lock()
+        self._phone_snapshot: PhoneSnapshot | None = None
+        self._phone_issue = ""
+        self._phone_epoch = 0
         self._rng = random.SystemRandom()
         # Incremented for every observed bound-chat message.  A model decision
         # is only valid for the revision it started from, which closes the
@@ -109,6 +120,11 @@ class NaturalCompanionPlugin(Star):
 
     async def initialize(self) -> None:
         """Restore one persisted opportunity without ever sending immediately."""
+        if self._phone_configured():
+            await self._sync_phone_bridge()
+            self._phone_task = asyncio.create_task(
+                self._watch_phone_bridge(), name=f"{PLUGIN_ID}:phone-bridge"
+            )
         async with self._state_lock:
             pending = self.state.pending_opportunity
             if not self.state.enabled or not self.state.bound_umo or not pending:
@@ -148,9 +164,10 @@ class NaturalCompanionPlugin(Star):
 
     async def terminate(self) -> None:
         self._closed = True
-        tasks = [self._pending_task, self._extract_task]
+        tasks = [self._pending_task, self._extract_task, self._phone_task]
         self._pending_task = None
         self._extract_task = None
+        self._phone_task = None
         for task in tasks:
             if task and not task.done():
                 task.cancel()
@@ -253,18 +270,39 @@ class NaturalCompanionPlugin(Star):
             async with self._state_lock:
                 if self.state.bound_umo and self.state.bound_umo != umo:
                     return "已经绑定了另一个私聊。请在原会话中操作，或由管理员发送 /主动聊天 重绑。"
+                was_enabled = self.state.enabled
                 self._cancel_pending_locked()
                 self._cancel_extract_locked()
                 self.state.bound_umo = umo
                 self.state.enabled = True
                 self.state.pending_opportunity = None
                 self._persist_locked()
+            await self._sync_phone_bridge()
+            # The watcher may have seen the phone history while paused.
+            if not was_enabled:
+                async with self._state_lock:
+                    if self.state.bound_umo == umo and self._phone_snapshot is not None and self._extract_task is None:
+                        latest_user = next(
+                            (item for item in reversed(self._phone_snapshot.events) if item.role == "user"), None
+                        )
+                        if latest_user:
+                            self._message_revision += 1
+                            self._extract_task = asyncio.create_task(
+                                self._debounced_state_refresh(
+                                    umo, self.state.last_user_message_at,
+                                    "[小手机已有对话] " + latest_user.content,
+                                    self._message_revision, allow_opportunity=False,
+                                ), name=f"{PLUGIN_ID}:phone-enable-refresh"
+                            )
+                            self._last_runtime_issue = "正在从已有小手机对话刷新状态（不补发主动消息）"
             return "已开启自然主动聊天。不会按固定时间发送，只会在出现合适理由时创建一次可取消的主动机会。"
 
         if not is_owner and not is_admin:
             return "这个主动聊天插件已经绑定到其他私聊，当前会话无权查看或修改它。"
 
         if action == "测试":
+            if not await self._sync_phone_bridge():
+                return "小手机同步尚不可用，未创建测试机会。请查询 /主动聊天 状态 并检查桥接配置。"
             async with self._state_lock:
                 if not self.state.enabled or self.state.bound_umo != umo:
                     return "请先在目标私聊中发送 /主动聊天 开启。"
@@ -296,10 +334,12 @@ class NaturalCompanionPlugin(Star):
                 # proactive history into the new private chat.
                 if self.state.bound_umo != umo:
                     self.state.clear_plugin_memory()
+                self._reset_phone_context_locked()
                 self.state.bound_umo = umo
                 self.state.enabled = True
                 self.state.pending_opportunity = None
                 self._persist_locked()
+            await self._sync_phone_bridge()
             return "已重新绑定到当前私聊，并开启自然主动聊天。"
 
         if action == "暂停":
@@ -317,9 +357,11 @@ class NaturalCompanionPlugin(Star):
                 self._cancel_pending_locked()
                 self._cancel_extract_locked()
                 self.state.clear_plugin_memory()
+                self._reset_phone_context_locked()
                 self.state.enabled = enabled
                 self.state.bound_umo = bound_umo
                 self._persist_locked()
+            await self._sync_phone_bridge(bootstrap_refresh=False)
             return "已清除插件保存的心情、情景、未完话题和主动消息记录；AstrBot 原有会话历史没有被删除。"
 
         if action == "解绑":
@@ -327,14 +369,168 @@ class NaturalCompanionPlugin(Star):
                 self._cancel_pending_locked()
                 self._cancel_extract_locked()
                 self.state = CompanionState()
+                self._reset_phone_context_locked()
                 self._persist_locked()
             return "已解绑当前私聊并清除插件状态。"
 
         if action == "状态":
+            await self._sync_phone_bridge()
             async with self._state_lock:
                 return self._format_status_locked()
 
         return "无法识别该操作。发送 /主动聊天 帮助 查看命令。"
+
+    def _phone_configured(self) -> bool:
+        return bool(self.config.get("phone_bridge_enabled"))
+
+    def _phone_path(self) -> Path:
+        configured = str(self.config.get("phone_bridge_path") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        # Alive Persona keeps this file under its plugin directory, not in our state dir.
+        return _plugin_state_path().parents[2] / "plugins" / "astrbot_plugin_alive_persona" / "data" / "sheshe_bridge.json"
+
+    async def _watch_phone_bridge(self) -> None:
+        # Poll only the local inbox, never a timer that decides to send messages.
+        while not self._closed:
+            await asyncio.sleep(max(1.0, _number(self.config.get("phone_bridge_check_seconds"), 5.0)))
+            try:
+                await self._sync_phone_bridge()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                async with self._state_lock:
+                    self._phone_failed_locked("小手机同步异常，请检查插件日志")
+                logger.warning(f"[{PLUGIN_ID}] 小手机同步异常，稍后继续检查：{type(exc).__name__}")
+
+    def _reset_phone_context_locked(self) -> None:
+        self._phone_epoch += 1
+        self._message_revision += 1
+        self._phone_snapshot = None
+        self._phone_issue = ""
+
+    def _phone_failed_locked(self, issue: str) -> None:
+        had_pending = self.state.pending_opportunity is not None
+        changed = issue != self._phone_issue or had_pending or self._extract_task is not None
+        self._phone_snapshot = None
+        self._phone_issue = issue
+        if changed:
+            self._message_revision += 1
+            self._cancel_pending_locked()
+            self._cancel_extract_locked()
+            self._last_runtime_issue = "小手机同步不可用，已停止本次主动机会"
+            if had_pending:
+                self._persist_locked()
+            self._debug(f"小手机同步暂不可用：{issue}")
+
+    async def _sync_phone_bridge(self, bootstrap_refresh: bool = True) -> bool:
+        """Observe new phone-user turns; never copy the transcript into plugin state."""
+        if not self._phone_configured() or self._closed:
+            return True
+        async with self._phone_sync_lock:
+            async with self._state_lock:
+                umo = self.state.bound_umo
+                epoch = self._phone_epoch
+            if not umo:
+                return True
+            qq_id = bound_qq_id(umo)
+            if not qq_id:
+                async with self._state_lock:
+                    if self.state.bound_umo == umo and self._phone_epoch == epoch:
+                        self._phone_failed_locked("绑定会话不是可识别的 OneBot QQ 私聊")
+                return False
+            try:
+                snapshot = await asyncio.to_thread(read_phone_snapshot, self._phone_path(), qq_id)
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                issue = (
+                    "桥接文件未找到或无法读取" if isinstance(exc, OSError)
+                    else "桥接文件格式或绑定 QQ 号不匹配"
+                )
+                async with self._state_lock:
+                    if self.state.bound_umo == umo and self._phone_epoch == epoch:
+                        self._phone_failed_locked(issue)
+                return False
+
+            async with self._state_lock:
+                if self._closed or self.state.bound_umo != umo or self._phone_epoch != epoch:
+                    return False
+                recovered = bool(self._phone_issue)
+                self._phone_issue = ""
+                self._phone_snapshot = snapshot
+                if recovered:
+                    self._last_runtime_issue = "小手机同步已恢复，等待新的对话状态"
+                ids = [item.id for item in snapshot.events]
+                if not self.state.phone_cursor_ready or self.state.phone_binding_id != snapshot.binding_id:
+                    if self.state.phone_cursor_ready and self.state.phone_binding_id != snapshot.binding_id:
+                        self._message_revision += 1
+                        self._cancel_pending_locked()
+                        self._cancel_extract_locked()
+                        self._last_runtime_issue = "小手机绑定变化，旧主动机会已取消"
+                    self.state.phone_binding_id = snapshot.binding_id
+                    self.state.phone_event_ids = ids[-80:]
+                    self.state.phone_cursor_ready = True
+                    latest_user = next(
+                        (item for item in reversed(snapshot.events) if item.role == "user"), None
+                    )
+                    if latest_user and bootstrap_refresh:
+                        # Existing phone turns are context, not a fresh reason to
+                        # send. Still refresh the QQ-visible state on first bind.
+                        self._message_revision += 1
+                        self._cancel_pending_locked()
+                        self._cancel_extract_locked()
+                        phone_time = _phone_event_time(latest_user.timestamp) or time.time()
+                        self.state.last_phone_message_at = phone_time
+                        self.state.last_user_message_at = max(
+                            self.state.last_user_message_at, phone_time
+                        )
+                        if self.state.enabled:
+                            self._last_runtime_issue = "正在从已有小手机对话刷新状态（不补发主动消息）"
+                            self._extract_task = asyncio.create_task(
+                                self._debounced_state_refresh(
+                                    umo, self.state.last_user_message_at,
+                                    "[小手机已有对话] " + latest_user.content,
+                                    self._message_revision, allow_opportunity=False,
+                                ), name=f"{PLUGIN_ID}:phone-initial-refresh"
+                            )
+                    self._persist_locked()
+                    return True
+
+                seen = set(self.state.phone_event_ids)
+                fresh = [item for item in snapshot.events if item.id not in seen]
+                if not fresh:
+                    return True
+                self.state.phone_event_ids = list(dict.fromkeys([*self.state.phone_event_ids, *ids]))[-80:]
+                user_turns = [item for item in fresh if item.role == "user"]
+                if user_turns:
+                    observed_at = time.time()
+                    self.state.last_user_message_at = observed_at
+                    self.state.last_phone_message_at = observed_at
+                    if any(self._is_exact_pause_phrase(item.content) for item in user_turns):
+                        self.state.enabled = False
+                # A phone assistant reply updates the transient context, but
+                # does not count as another user turn or cancel an opportunity.
+                if user_turns:
+                    self._message_revision += 1
+                    self._cancel_pending_locked()
+                    self._cancel_extract_locked()
+                    self._last_runtime_issue = "已同步小手机对话，正在更新对话状态" if self.state.enabled else "已同步小手机对话（主动聊天已暂停）"
+                    if self.state.enabled:
+                        latest = next(
+                            (item.content for item in reversed(snapshot.events) if item.role == "user"), ""
+                        )
+                        self._extract_task = asyncio.create_task(
+                            self._debounced_state_refresh(
+                                umo, self.state.last_user_message_at,
+                                "[小手机用户消息] " + latest, self._message_revision,
+                            ), name=f"{PLUGIN_ID}:phone-state-refresh"
+                        )
+                self._persist_locked()
+                return True
+
+    def _phone_context(self) -> str:
+        if not self._phone_configured() or self._phone_snapshot is None:
+            return ""
+        return phone_context(self._phone_snapshot)
 
     async def _observe_bound_message(self, event: AstrMessageEvent, text: str) -> None:
         if self._ignore_non_user_event(event):
@@ -363,7 +559,7 @@ class NaturalCompanionPlugin(Star):
             self._persist_locked()
             if has_extractable_text:
                 self._extract_task = asyncio.create_task(
-                    self._debounced_state_refresh(umo, timestamp, observed_text),
+                    self._debounced_state_refresh(umo, timestamp, observed_text, self._message_revision),
                     name=f"{PLUGIN_ID}:state-refresh",
                 )
 
@@ -372,29 +568,37 @@ class NaturalCompanionPlugin(Star):
         umo: str,
         observed_at: float,
         latest_message: str,
+        message_revision: int | None = None,
+        allow_opportunity: bool = True,
     ) -> None:
         try:
+            if message_revision is None:
+                message_revision = self._message_revision
             delay = max(0.0, _number(self.config.get("state_extract_debounce_seconds"), 15.0))
             await asyncio.sleep(delay)
+            if not await self._sync_phone_bridge():
+                return
             async with self._state_lock:
                 if self._closed:
                     return
                 if not self.state.enabled or self.state.bound_umo != umo:
                     return
-                if self.state.last_user_message_at != observed_at:
+                if self.state.last_user_message_at != observed_at or self._message_revision != message_revision:
                     return
                 state_snapshot = CompanionState.from_dict(self.state.to_dict())
 
             payload = await self._extract_state_with_model(
                 umo, latest_message, state_snapshot
             )
+            if not await self._sync_phone_bridge():
+                return
 
             async with self._state_lock:
                 if self._closed:
                     return
                 if not self.state.enabled or self.state.bound_umo != umo:
                     return
-                if self.state.last_user_message_at != observed_at:
+                if self.state.last_user_message_at != observed_at or self._message_revision != message_revision:
                     return
                 if not payload:
                     # Invalid JSON or an unavailable conversation must not alter
@@ -411,6 +615,10 @@ class NaturalCompanionPlugin(Star):
                     self.state.last_interaction_summary = truncate(
                         current_scene, 500
                     )
+                if not allow_opportunity:
+                    self._last_runtime_issue = "已从小手机对话更新状态（历史消息不补发）"
+                    self._persist_locked()
+                    return
                 candidate = evaluate_opportunity(self.state, time.time(), self.config)
                 if candidate:
                     self._arm_candidate_locked(candidate)
@@ -447,11 +655,14 @@ class NaturalCompanionPlugin(Star):
 近期会话：
 {history or '暂无可读取的会话历史。'}
 
+同一用户在小手机的近期对话（临时上下文，与 QQ 共用状态；根据时间判断新旧）：
+{self._phone_context() or '没有可用的小手机对话。'}
+
 用户最新消息：
 {truncate(latest_message, 1000)}
 
 已有插件状态：
-{json.dumps(state_for_prompt.to_dict(), ensure_ascii=False)}
+{json.dumps(_state_for_prompt(state_for_prompt), ensure_ascii=False)}
 
 只输出如下结构的 JSON；没有依据的数组返回空数组，不要编造：
 {{
@@ -474,6 +685,9 @@ class NaturalCompanionPlugin(Star):
         candidate: Mapping[str, Any],
         delay_seconds: float | None = None,
     ) -> None:
+        if self._phone_configured() and (self._phone_issue or self._phone_snapshot is None):
+            self._last_runtime_issue = "小手机同步不可用，未创建主动机会"
+            return
         self._cancel_pending_locked()
         opportunity_id = uuid.uuid4().hex
         delay = (
@@ -512,6 +726,8 @@ class NaturalCompanionPlugin(Star):
     async def _wait_and_decide(self, opportunity_id: str, due_at: float) -> None:
         try:
             await asyncio.sleep(max(0.0, due_at - time.time()))
+            if not await self._sync_phone_bridge():
+                return
             async with self._state_lock:
                 pending = self.state.pending_opportunity
                 if not pending or str(pending.get("id")) != opportunity_id:
@@ -539,6 +755,10 @@ class NaturalCompanionPlugin(Star):
                 self._last_runtime_issue = "正在读取会话并调用模型进行发送前判断"
 
             decision = await self._decide_with_model(umo, snapshot, candidate)
+            # Catch phone messages that arrived while the model was generating,
+            # even if the background inbox watcher has not run yet.
+            if not await self._sync_phone_bridge():
+                return
 
             async with self._state_lock:
                 pending = self.state.pending_opportunity
@@ -669,8 +889,11 @@ class NaturalCompanionPlugin(Star):
 近期会话：
 {history or '暂无可读取的会话历史。'}
 
+同一用户在小手机的近期对话（临时上下文，与 QQ 共用状态；根据时间判断新旧）：
+{self._phone_context() or '没有可用的小手机对话。'}
+
 插件结构化状态：
-{json.dumps(state.to_dict(), ensure_ascii=False)}
+{json.dumps(_state_for_prompt(state), ensure_ascii=False)}
 
 本次主动机会：
 {json.dumps(dict(candidate), ensure_ascii=False)}
@@ -961,6 +1184,16 @@ class NaturalCompanionPlugin(Star):
         else:
             pending_text = "无待判断机会"
         scene = truncate(self.state.current_scene or self.state.last_interaction_summary, 100)
+        if not self._phone_configured():
+            phone_status = "未启用"
+        elif not self.state.bound_umo:
+            phone_status = "等待绑定 QQ 私聊"
+        elif self._phone_issue:
+            phone_status = f"不可用（{self._phone_issue}；暂停主动机会）"
+        elif self._phone_snapshot is None:
+            phone_status = "等待读取桥接文件"
+        else:
+            phone_status = "已连接"
         return (
             f"自然主动聊天：{enabled}，{bound}\n"
             f"插件版本：{PLUGIN_VERSION}\n"
@@ -971,6 +1204,8 @@ class NaturalCompanionPlugin(Star):
             f"未完话题：{len(self.state.unfinished_topics)} 个\n"
             f"最近用户消息：{_format_time(self.state.last_user_message_at)}\n"
             f"最近主动消息：{_format_time(self.state.last_proactive_message_at)}\n"
+            f"小手机互通：{phone_status}\n"
+            f"最近小手机消息：{_format_time(self.state.last_phone_message_at)}\n"
             f"主动机会：{pending_text}\n"
             f"处理状态：{self._last_runtime_issue or '等待新的对话状态'}"
             + (
@@ -983,6 +1218,14 @@ class NaturalCompanionPlugin(Star):
     def _debug(self, message: str) -> None:
         if bool(self.config.get("debug_logging", False)):
             logger.info(f"[{PLUGIN_ID}] {message}")
+
+
+def _state_for_prompt(state: CompanionState) -> dict[str, Any]:
+    """Keep routing IDs and the inbox cursor out of model requests."""
+    value = state.to_dict()
+    for key in ("bound_umo", "phone_binding_id", "phone_event_ids", "phone_cursor_ready", "pending_opportunity"):
+        value.pop(key, None)
+    return value
 
 
 def _plugin_state_path() -> Path:
@@ -1009,6 +1252,13 @@ def _number(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _phone_event_time(timestamp: str) -> float:
+    try:
+        return min(time.time(), max(0.0, datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()))
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
 
 
 def _format_time(timestamp: float) -> str:

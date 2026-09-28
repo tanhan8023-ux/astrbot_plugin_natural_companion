@@ -116,5 +116,25 @@
     "description": "输出主动机会调试日志",
     "type": "bool",
     "default": false
+  },
+  "phone_bridge_enabled": {
+    "description": "启用小手机（Alive Persona）对话互通",
+    "type": "bool",
+    "default": false,
+    "hint": "需先在小手机插件绑定同一个 QQ 号；开启后重载本插件。仅读取本机桥接文件，不向小手机写入内容。"
+  },
+  "phone_bridge_path": {
+    "description": "小手机桥接文件路径",
+    "type": "string",
+    "default": "",
+    "hint": "填写 AstrBot 实际运行环境中 Alive Persona/data/sheshe_bridge.json 的绝对路径；留空时尝试标准插件目录。Docker 请填容器内路径。"
+  },
+  "phone_bridge_check_seconds": {
+    "description": "检查小手机新对话的间隔（秒）",
+    "type": "int",
+    "default": 5,
+    "min": 1,
+    "max": 300,
+    "hint": "只检查本地桥接文件中的新消息；不是定时发送主动消息。"
   }
 }
