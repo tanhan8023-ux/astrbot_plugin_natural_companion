@@ -48,6 +48,9 @@ except ImportError:  # pragma: no cover - convenient for local smoke imports
     )
 
 
+PLUGIN_VERSION = "0.1.2"
+
+
 # In QQ clients it is common to prepend the bot nickname directly to a
 # command, e.g. ``系尔主动聊天 测试``.  Keep the normal slash form while
 # accepting a short nickname prefix so that such a command is not treated as
@@ -101,6 +104,8 @@ class NaturalCompanionPlugin(Star):
         self._message_revision = 0
         self._closed = False
         self._last_runtime_issue = ""
+        self._last_ignored_event = ""
+        self._ignored_event_count = 0
 
     async def initialize(self) -> None:
         """Restore one persisted opportunity without ever sending immediately."""
@@ -160,6 +165,10 @@ class NaturalCompanionPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=100)
     async def on_private_message(self, event: AstrMessageEvent):
         """Handle commands and observe normal messages without blocking AstrBot replies."""
+        # AstrBot also wraps OneBot notices (including typing) as private
+        # AstrMessageEvents. The PRIVATE_MESSAGE decorator alone is not enough.
+        if self._ignore_non_user_event(event):
+            return
         text = str(getattr(event, "message_str", "") or "").strip()
         command = self._parse_command(text)
         if command is not None:
@@ -184,6 +193,9 @@ class NaturalCompanionPlugin(Star):
         await self._observe_bound_message(event, text)
 
     def _parse_command(self, text: str) -> str | None:
+        # A negative phrase must not be swallowed by nickname-prefix support.
+        if self._is_exact_pause_phrase(text):
+            return None
         match = COMMAND_PATTERN.fullmatch(text)
         if not match:
             return None
@@ -257,6 +269,7 @@ class NaturalCompanionPlugin(Star):
                 if not self.state.enabled or self.state.bound_umo != umo:
                     return "请先在目标私聊中发送 /主动聊天 开启。"
                 self._cancel_pending_locked()
+                self._cancel_extract_locked()
                 now = time.time()
                 candidate = {
                     "reason_type": "natural_greeting",
@@ -269,7 +282,10 @@ class NaturalCompanionPlugin(Star):
                     _number(self.config.get("test_delay_seconds"), 10.0),
                 )
                 self._arm_candidate_locked(candidate, delay_seconds=delay)
-            return f"已创建测试主动机会，约 {int(delay)} 秒后进行发送测试；期间不要再发消息。"
+            return (
+                f"已创建测试主动机会，约 {int(delay)} 秒后开始模型判断（还需模型响应时间）。"
+                "期间请勿发送新消息；输入状态通知和 /主动聊天 状态 不会取消任务。"
+            )
 
         if action == "重绑":
             async with self._state_lock:
@@ -321,6 +337,8 @@ class NaturalCompanionPlugin(Star):
         return "无法识别该操作。发送 /主动聊天 帮助 查看命令。"
 
     async def _observe_bound_message(self, event: AstrMessageEvent, text: str) -> None:
+        if self._ignore_non_user_event(event):
+            return
         # Even a non-text message (image, sticker, etc.) is an interaction and
         # must cancel a waiting proactive task.  State extraction is skipped
         # only when AstrBot exposes no usable outline at all.
@@ -518,6 +536,7 @@ class NaturalCompanionPlugin(Star):
                 snapshot = CompanionState.from_dict(self.state.to_dict())
                 candidate = dict(pending)
                 message_revision = self._message_revision
+                self._last_runtime_issue = "正在读取会话并调用模型进行发送前判断"
 
             decision = await self._decide_with_model(umo, snapshot, candidate)
 
@@ -557,6 +576,7 @@ class NaturalCompanionPlugin(Star):
                 # call returns.  A new user message can still cancel this task;
                 # on restart, `initialize()` will never replay an in-flight send.
                 pending["status"] = "sending"
+                self._last_runtime_issue = "模型判断已完成，正在通过 OneBot 发送"
                 self._persist_locked()
 
             success, error = await self._send_proactive_message(umo, message)
@@ -830,6 +850,62 @@ class NaturalCompanionPlugin(Star):
     def _is_bound_event(self, event: AstrMessageEvent) -> bool:
         return self.state.bound_umo == str(event.unified_msg_origin)
 
+    def _ignore_non_user_event(self, event: AstrMessageEvent) -> bool:
+        reason = self._non_user_event_reason(event)
+        if not reason:
+            return False
+        # Keep diagnostics separate from the task outcome and persisted state.
+        # Do not stop_event(): debounce/typing plugins still need these notices.
+        if self._is_bound_event(event):
+            self._ignored_event_count += 1
+            self._last_ignored_event = reason
+            self._debug(f"已忽略{reason}，未更新互动状态、未取消主动机会")
+        return True
+
+    @staticmethod
+    def _non_user_event_reason(event: AstrMessageEvent) -> str:
+        message_obj = getattr(event, "message_obj", None)
+        raw = getattr(message_obj, "raw_message", None)
+        raw = raw if isinstance(raw, Mapping) else {}
+        post_type = raw.get("post_type")
+        if raw.get("sub_type") == "input_status":
+            return "输入状态通知"
+        if post_type and post_type != "message":
+            return {
+                "notice": "OneBot 通知事件",
+                "meta_event": "OneBot 元事件",
+                "request": "OneBot 请求事件",
+                "message_sent": "机器人已发送回执",
+            }.get(post_type, "非消息事件")
+        # Some wrappers omit post_type but retain the notice discriminator.
+        if any(raw.get(key) for key in ("notice_type", "meta_event_type", "request_type")):
+            return "OneBot 非消息通知"
+        if raw.get("message_type") not in (None, "", "private"):
+            return "非私聊消息"
+        if getattr(message_obj, "group_id", None) not in (None, "", 0, "0"):
+            return "群聊消息"
+
+        self_id = raw.get("self_id") or getattr(message_obj, "self_id", None)
+        sender = raw.get("sender")
+        sender_id = raw.get("user_id")
+        if not sender_id and isinstance(sender, Mapping):
+            sender_id = sender.get("user_id")
+        if not sender_id:
+            sender_id = getattr(getattr(message_obj, "sender", None), "user_id", None)
+        if self_id and sender_id and str(self_id) == str(sender_id):
+            return "机器人自身消息"
+
+        # Text can be empty for real images, voices, files, and QQ stickers.
+        # Accept raw segments even when the adapter cannot normalize them.
+        if (
+            str(getattr(event, "message_str", "") or "").strip()
+            or getattr(message_obj, "message", None)
+            or raw.get("message")
+            or raw.get("raw_message")
+        ):
+            return ""
+        return "空事件（没有消息内容）"
+
     @staticmethod
     def _message_outline(event: AstrMessageEvent) -> str:
         getter = getattr(event, "get_message_outline", None)
@@ -887,6 +963,7 @@ class NaturalCompanionPlugin(Star):
         scene = truncate(self.state.current_scene or self.state.last_interaction_summary, 100)
         return (
             f"自然主动聊天：{enabled}，{bound}\n"
+            f"插件版本：{PLUGIN_VERSION}\n"
             f"当前心情：{self.state.mood.label}"
             + (f"（{self.state.mood.note}）" if self.state.mood.note else "")
             + "\n"
@@ -896,6 +973,11 @@ class NaturalCompanionPlugin(Star):
             f"最近主动消息：{_format_time(self.state.last_proactive_message_at)}\n"
             f"主动机会：{pending_text}\n"
             f"处理状态：{self._last_runtime_issue or '等待新的对话状态'}"
+            + (
+                f"\n事件过滤：已忽略 {self._ignored_event_count} 个非用户消息事件，"
+                f"最近为{self._last_ignored_event}（不影响主动任务）"
+                if self._last_ignored_event else ""
+            )
         )
 
     def _debug(self, message: str) -> None:
